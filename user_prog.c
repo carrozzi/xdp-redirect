@@ -21,6 +21,11 @@
 #include <poll.h>
 #include <sys/mman.h>
 #include <limits.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <arpa/inet.h>
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
 
 #include "../common/common_defines.h"
 #include "../common/common_user_bpf_xdp.h"
@@ -53,6 +58,7 @@ struct xsk_socket_info {
 
 static struct xsk_socket_info *xsk_info = NULL;
 static pthread_t xsk_thread;
+static char *output_ifname = NULL;
 
 static void sig_int(int signo)
 {
@@ -155,26 +161,48 @@ static void xsk_free_umem_frame(struct xsk_socket_info *xsk, uint64_t addr)
 	xsk->umem_frame_addr[xsk->umem_frame_free++] = addr;
 }
 
-static void hexdump_packet(const void *data, size_t len, size_t max_len)
+static int send_packet_to_interface(const void *data, size_t len, const char *ifname)
 {
-	const unsigned char *bytes = (const unsigned char *)data;
-	size_t dump_len = len < max_len ? len : max_len;
-	
-	for (size_t i = 0; i < dump_len; i++) {
-		if (i % 16 == 0)
-			printf("  %04zx: ", i);
-		printf("%02x ", bytes[i]);
-		if (i % 16 == 15 || i == dump_len - 1) {
-			/* Print ASCII representation */
-			for (size_t j = (i / 16) * 16; j <= i; j++) {
-				unsigned char c = bytes[j];
-				printf("%c", (c >= 32 && c < 127) ? c : '.');
-			}
-			printf("\n");
-		}
+	struct sockaddr_ll saddr;
+	struct ifreq ifr;
+	int sock;
+	int ret;
+
+	/* Create raw socket */
+	sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+	if (sock < 0) {
+		fprintf(stderr, "ERR: Failed to create raw socket: %s\n", strerror(errno));
+		return -1;
 	}
-	if (len > max_len)
-		printf("  ... (truncated, total length: %zu bytes)\n", len);
+
+	/* Get interface index */
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+	ret = ioctl(sock, SIOCGIFINDEX, &ifr);
+	if (ret < 0) {
+		fprintf(stderr, "ERR: Failed to get interface index for %s: %s\n",
+			ifname, strerror(errno));
+		close(sock);
+		return -1;
+	}
+
+	/* Setup destination address */
+	memset(&saddr, 0, sizeof(saddr));
+	saddr.sll_family = AF_PACKET;
+	saddr.sll_protocol = htons(ETH_P_ALL);
+	saddr.sll_ifindex = ifr.ifr_ifindex;
+	saddr.sll_halen = ETH_ALEN;
+
+	/* Send packet */
+	ret = sendto(sock, data, len, 0, (struct sockaddr *)&saddr, sizeof(saddr));
+	close(sock);
+
+	if (ret < 0) {
+		fprintf(stderr, "ERR: Failed to send packet: %s\n", strerror(errno));
+		return -1;
+	}
+
+	return 0;
 }
 
 static void *xsk_packet_reader(void *arg)
@@ -217,10 +245,14 @@ static void *xsk_packet_reader(void *arg)
 			uint32_t len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
 			uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 
-			/* Hexdump first 32 bytes */
-			printf("\n=== Matching Packet (AF_XDP) ===\n");
-			printf("Length: %u bytes\n", len);
-			hexdump_packet(pkt, len, 32);
+			/* Send packet to output interface */
+			if (output_ifname) {
+				if (send_packet_to_interface(pkt, len, output_ifname) == 0) {
+					/* Packet sent successfully */
+				} else {
+					fprintf(stderr, "WARNING: Failed to send packet of %u bytes\n", len);
+				}
+			}
 
 			/* Free the frame back to the umem */
 			xsk_free_umem_frame(xsk, addr);
@@ -244,7 +276,7 @@ static void *xsk_packet_reader(void *arg)
 	return NULL;
 }
 
-static int setup_af_xdp_socket(const char *ifname, int ifindex, struct bpf_object *bpf_obj)
+static int setup_af_xdp_socket(const char *ifname, int ifindex, struct bpf_object *bpf_obj, const char *out_ifname)
 {
 	struct xsk_umem_info *umem;
 	struct xsk_umem_config umem_cfg = {
@@ -502,7 +534,8 @@ int main(int argc, char **argv)
 	       cfg.ifname, cfg.ifindex);
 	
 	/* Setup AF_XDP socket for matching packets */
-	if (setup_af_xdp_socket(cfg.ifname, cfg.ifindex, bpf_obj) < 0) {
+	output_ifname = argv[2]; /* Store output interface name for packet reader */
+	if (setup_af_xdp_socket(cfg.ifname, cfg.ifindex, bpf_obj, argv[2]) < 0) {
 		fprintf(stderr, "WARNING: Failed to setup AF_XDP socket, matching packets will go to output interface\n");
 	} else {
 		/* Start packet reader thread */
@@ -515,7 +548,7 @@ int main(int argc, char **argv)
 	}
 	
 	printf("\nNOTE: Make sure there is traffic on %s for counters to increment.\n", cfg.ifname);
-	printf("      Matching packets will be hexdumped from AF_XDP socket.\n");
+	printf("      Matching packets will be sent to %s via AF_XDP socket.\n", argv[2]);
 	printf("      Non-matching packets will be redirected to %s.\n", argv[2]);
 	printf("Press Ctrl+C to stop\n\n");
 	
