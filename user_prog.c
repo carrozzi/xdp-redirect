@@ -121,6 +121,7 @@ int main(int argc, char **argv)
 		.do_unload = false,
 		.attach_mode = XDP_MODE_NATIVE,
 	};
+	enum xdp_attach_mode output_attach_mode = XDP_MODE_NATIVE;
 	int err = 0;
 	int interval = 2; /* Default 2 seconds */
 	char errmsg[1024];
@@ -177,21 +178,50 @@ int main(int argc, char **argv)
 	}
 	
 	/* Attach a simple XDP_PASS program to output interface (required for redirect) */
-	struct config cfg_output = {
-		.ifindex = output_ifindex,
-		.do_unload = false,
-		.attach_mode = XDP_MODE_NATIVE,
-	};
-	strncpy(cfg_output.ifname_buf, argv[2], IF_NAMESIZE - 1);
-	cfg_output.ifname = cfg_output.ifname_buf;
-	strncpy(cfg_output.filename, "xdp_prog.o", sizeof(cfg_output.filename));
-	strncpy(cfg_output.progname, "xdp_pass_func", sizeof(cfg_output.progname));
+	/* Load it directly so we can handle errors gracefully */
+	DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts2);
+	DECLARE_LIBXDP_OPTS(xdp_program_opts, xdp_opts2, 0);
 	
-	output_program = load_bpf_and_xdp_attach(&cfg_output);
-	if (!output_program) {
-		fprintf(stderr, "ERR: Failed to load and attach XDP program to output interface\n");
+	xdp_opts2.open_filename = "xdp_prog.o";
+	xdp_opts2.prog_name = "xdp_pass_func";
+	xdp_opts2.opts = &opts2;
+	
+	output_program = xdp_program__create(&xdp_opts2);
+	err = libxdp_get_error(output_program);
+	if (err) {
+		libxdp_strerror(err, errmsg, sizeof(errmsg));
+		fprintf(stderr, "ERR: Failed to load XDP program 'xdp_pass_func': %s\n", errmsg);
 		err = EXIT_FAIL_BPF;
 		goto cleanup;
+	}
+	
+	/* Try native mode first, fall back to SKB mode if not supported */
+	err = xdp_program__attach(output_program, output_ifindex, XDP_MODE_NATIVE, 0);
+	if (err) {
+		/* If native mode fails, try SKB mode */
+		output_attach_mode = XDP_MODE_SKB;
+		err = xdp_program__attach(output_program, output_ifindex, output_attach_mode, 0);
+		if (err) {
+			libxdp_strerror(err, errmsg, sizeof(errmsg));
+			fprintf(stderr, "ERR: Failed to attach XDP program to output interface %s "
+				"(tried both native and SKB modes): %s\n", argv[2], errmsg);
+			xdp_program__close(output_program);
+			output_program = NULL;
+			err = EXIT_FAIL_BPF;
+			goto cleanup;
+		}
+		printf("Attached XDP program to output interface %s in SKB mode\n", argv[2]);
+	} else {
+		printf("Attached XDP program to output interface %s in native mode\n", argv[2]);
+	}
+	
+	/* Initialize global stats map to ensure it exists */
+	int map_fd_global = find_map_fd(bpf_obj, "global_stats_map");
+	if (map_fd_global >= 0) {
+		__u32 zero = 0;
+		struct global_stats init_stats = {0};
+		/* Try to initialize - ignore error if already exists */
+		bpf_map_update_elem(map_fd_global, &zero, &init_stats, BPF_NOEXIST);
 	}
 	
 	/* Configure redirect map with output interface */
@@ -225,6 +255,9 @@ int main(int argc, char **argv)
 	printf("Verified tx_port map: key=0 -> ifindex=%u\n", verify_ifindex);
 	printf("XDP program attached to input interface %s (ifindex %d)\n", 
 	       cfg.ifname, cfg.ifindex);
+	
+	printf("\nNOTE: Make sure there is traffic on %s for counters to increment.\n", cfg.ifname);
+	printf("      You can test with: ping6 or send test packets to the interface.\n");
 	printf("Press Ctrl+C to stop\n\n");
 	
 	/* Set up signal handler */
@@ -243,7 +276,7 @@ int main(int argc, char **argv)
 	
 cleanup:
 	if (output_program) {
-		int detach_err = xdp_program__detach(output_program, output_ifindex, cfg.attach_mode, 0);
+		int detach_err = xdp_program__detach(output_program, output_ifindex, output_attach_mode, 0);
 		if (detach_err) {
 			libxdp_strerror(detach_err, errmsg, sizeof(errmsg));
 			fprintf(stderr, "Error detaching output XDP program: %s\n", errmsg);

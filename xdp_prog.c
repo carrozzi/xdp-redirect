@@ -37,8 +37,8 @@ struct {
 /* Map for redirecting packets to output interface */
 struct {
 	__uint(type, BPF_MAP_TYPE_DEVMAP);
-	__type(key, int);
-	__type(value, int);
+	__type(key, __u32);
+	__type(value, __u32);
 	__uint(max_entries, 1);
 } tx_port SEC(".maps");
 
@@ -120,15 +120,29 @@ int xdp_macsec_stats(struct xdp_md *ctx)
 	__u32 zero = 0;
 	struct mpls_label_stats *label_stats;
 	struct global_stats *global_stats;
-	struct global_stats new_global_stats = {0};
 	
-	/* Increment total packet counter for all packets */
+	/* Increment total packet counter for all packets - do this FIRST */
+	/* Always try to get existing entry first */
 	global_stats = bpf_map_lookup_elem(&global_stats_map, &zero);
-	if (!global_stats) {
-		new_global_stats.total_packets = 1;
-		bpf_map_update_elem(&global_stats_map, &zero, &new_global_stats, BPF_ANY);
-	} else {
+	if (global_stats) {
+		/* Entry exists, atomically increment */
 		__sync_fetch_and_add(&global_stats->total_packets, 1);
+	} else {
+		/* Entry doesn't exist, create it with initial value */
+		struct global_stats new_global_stats = {
+			.total_packets = 1,
+			.total_matching_packets = 0,
+			.packet_counter = 0
+		};
+		/* Use BPF_NOEXIST to ensure we're creating, not overwriting */
+		/* If it fails, try BPF_ANY (race condition - another CPU created it) */
+		if (bpf_map_update_elem(&global_stats_map, &zero, &new_global_stats, BPF_NOEXIST) != 0) {
+			/* Entry was created by another CPU, try to increment it */
+			global_stats = bpf_map_lookup_elem(&global_stats_map, &zero);
+			if (global_stats) {
+				__sync_fetch_and_add(&global_stats->total_packets, 1);
+			}
+		}
 	}
 	
 	/* Parse outer Ethernet header */
@@ -216,9 +230,11 @@ int xdp_macsec_stats(struct xdp_md *ctx)
 			global_stats->packet_counter = packet_number;
 	} else {
 		/* This shouldn't happen since we initialize above, but handle it */
-		new_global_stats.total_packets = 1;
-		new_global_stats.total_matching_packets = 1;
-		new_global_stats.packet_counter = packet_number;
+		struct global_stats new_global_stats = {
+			.total_packets = 1,
+			.total_matching_packets = 1,
+			.packet_counter = packet_number
+		};
 		bpf_map_update_elem(&global_stats_map, &zero, &new_global_stats, BPF_ANY);
 	}
 	
@@ -237,7 +253,8 @@ int xdp_macsec_stats(struct xdp_md *ctx)
 			label_stats->latest_packet_num = packet_number;
 	}
 	
-	/* For now, redirect all packets (matching and non-matching) to output interface */
+	/* Redirect matching packets to output interface */
+	/* bpf_redirect_map returns XDP_REDIRECT on success */
 	return bpf_redirect_map(&tx_port, 0, 0);
 }
 
