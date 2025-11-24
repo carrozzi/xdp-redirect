@@ -42,6 +42,14 @@ struct {
 	__uint(max_entries, 1);
 } tx_port SEC(".maps");
 
+/* Map for redirecting matching packets to AF_XDP socket */
+struct {
+	__uint(type, BPF_MAP_TYPE_XSKMAP);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, 1);
+} xsks_map SEC(".maps");
+
 /* Ethernet header */
 struct ethhdr {
 	__u8 h_dest[6];
@@ -253,9 +261,15 @@ int xdp_macsec_stats(struct xdp_md *ctx)
 			label_stats->latest_packet_num = packet_number;
 	}
 	
-	/* Redirect matching packets to output interface */
+	/* Redirect matching packets to AF_XDP socket */
 	/* bpf_redirect_map returns XDP_REDIRECT on success */
-	return bpf_redirect_map(&tx_port, 0, 0);
+	/* If AF_XDP socket not available, fall back to output interface */
+	int ret = bpf_redirect_map(&xsks_map, 0, 0);
+	if (ret != XDP_REDIRECT) {
+		/* Fall back to output interface if AF_XDP socket not configured */
+		return bpf_redirect_map(&tx_port, 0, 0);
+	}
+	return ret;
 }
 
 /* Simple XDP program for output interface - just passes packets through */

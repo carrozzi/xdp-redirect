@@ -13,9 +13,14 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <xdp/libxdp.h>
+#include <xdp/xsk.h>
 #include <linux/if_link.h>
 #include <stdbool.h>
 #include <net/if.h>
+#include <pthread.h>
+#include <poll.h>
+#include <sys/mman.h>
+#include <limits.h>
 
 #include "../common/common_defines.h"
 #include "../common/common_user_bpf_xdp.h"
@@ -23,6 +28,31 @@
 #include "xdp_prog.h"
 
 static volatile bool exiting = false;
+
+/* AF_XDP socket configuration */
+#define NUM_FRAMES         4096
+#define FRAME_SIZE         XSK_UMEM__DEFAULT_FRAME_SIZE
+#define RX_BATCH_SIZE      64
+#define INVALID_UMEM_FRAME UINT64_MAX
+
+struct xsk_umem_info {
+	struct xsk_ring_prod fq;
+	struct xsk_ring_cons cq;
+	struct xsk_umem *umem;
+	void *buffer;
+};
+
+struct xsk_socket_info {
+	struct xsk_ring_cons rx;
+	struct xsk_ring_prod tx;
+	struct xsk_umem_info *umem;
+	struct xsk_socket *xsk;
+	uint64_t umem_frame_addr[NUM_FRAMES];
+	uint32_t umem_frame_free;
+};
+
+static struct xsk_socket_info *xsk_info = NULL;
+static pthread_t xsk_thread;
 
 static void sig_int(int signo)
 {
@@ -109,6 +139,221 @@ static void print_stats(struct bpf_object *bpf_obj)
 	
 	printf("\n");
 	fflush(stdout);
+}
+
+/* AF_XDP helper functions */
+static uint64_t xsk_alloc_umem_frame(struct xsk_socket_info *xsk)
+{
+	if (xsk->umem_frame_free == 0)
+		return INVALID_UMEM_FRAME;
+
+	return xsk->umem_frame_addr[--xsk->umem_frame_free];
+}
+
+static void xsk_free_umem_frame(struct xsk_socket_info *xsk, uint64_t addr)
+{
+	xsk->umem_frame_addr[xsk->umem_frame_free++] = addr;
+}
+
+static void hexdump_packet(const void *data, size_t len, size_t max_len)
+{
+	const unsigned char *bytes = (const unsigned char *)data;
+	size_t dump_len = len < max_len ? len : max_len;
+	
+	for (size_t i = 0; i < dump_len; i++) {
+		if (i % 16 == 0)
+			printf("  %04zx: ", i);
+		printf("%02x ", bytes[i]);
+		if (i % 16 == 15 || i == dump_len - 1) {
+			/* Print ASCII representation */
+			for (size_t j = (i / 16) * 16; j <= i; j++) {
+				unsigned char c = bytes[j];
+				printf("%c", (c >= 32 && c < 127) ? c : '.');
+			}
+			printf("\n");
+		}
+	}
+	if (len > max_len)
+		printf("  ... (truncated, total length: %zu bytes)\n", len);
+}
+
+static void *xsk_packet_reader(void *arg)
+{
+	struct xsk_socket_info *xsk = (struct xsk_socket_info *)arg;
+	struct pollfd fds[1];
+	unsigned int rcvd;
+	uint32_t idx_rx = 0, idx_fq = 0;
+	int ret;
+
+	memset(fds, 0, sizeof(fds));
+	fds[0].fd = xsk_socket__fd(xsk->xsk);
+	fds[0].events = POLLIN;
+
+	while (!exiting) {
+		ret = poll(fds, 1, 100); /* 100ms timeout */
+		if (ret <= 0)
+			continue;
+
+		/* Receive packets */
+		rcvd = xsk_ring_cons__peek(&xsk->rx, RX_BATCH_SIZE, &idx_rx);
+		if (!rcvd) {
+			/* No packets, refill fill queue if needed */
+			uint32_t free_frames = xsk->umem_frame_free;
+			if (free_frames > 0) {
+				ret = xsk_ring_prod__reserve(&xsk->umem->fq, free_frames, &idx_fq);
+				if (ret == free_frames) {
+					for (uint32_t i = 0; i < free_frames; i++)
+						*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) =
+							xsk_alloc_umem_frame(xsk);
+					xsk_ring_prod__submit(&xsk->umem->fq, free_frames);
+				}
+			}
+			continue;
+		}
+
+		/* Process received packets */
+		for (unsigned int i = 0; i < rcvd; i++) {
+			uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
+			uint32_t len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
+			uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+
+			/* Hexdump first 32 bytes */
+			printf("\n=== Matching Packet (AF_XDP) ===\n");
+			printf("Length: %u bytes\n", len);
+			hexdump_packet(pkt, len, 32);
+
+			/* Free the frame back to the umem */
+			xsk_free_umem_frame(xsk, addr);
+		}
+
+		xsk_ring_cons__release(&xsk->rx, rcvd);
+
+		/* Refill fill queue */
+		uint32_t free_frames = xsk->umem_frame_free;
+		if (free_frames > 0) {
+			ret = xsk_ring_prod__reserve(&xsk->umem->fq, free_frames, &idx_fq);
+			if (ret == free_frames) {
+				for (uint32_t i = 0; i < free_frames; i++)
+					*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) =
+						xsk_alloc_umem_frame(xsk);
+				xsk_ring_prod__submit(&xsk->umem->fq, free_frames);
+			}
+		}
+	}
+
+	return NULL;
+}
+
+static int setup_af_xdp_socket(const char *ifname, int ifindex, struct bpf_object *bpf_obj)
+{
+	struct xsk_umem_info *umem;
+	struct xsk_umem_config umem_cfg = {
+		.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
+		.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
+		.frame_size = FRAME_SIZE,
+		.frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
+		.flags = 0,
+	};
+	struct xsk_socket_config xsk_cfg = {
+		.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
+		.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
+		.libbpf_flags = 0,
+		.xdp_flags = 0,
+		.bind_flags = XDP_USE_NEED_WAKEUP,
+	};
+	void *umem_buffer;
+	int ret;
+	int map_fd_xsks;
+
+	/* Allocate umem buffer */
+	umem_buffer = mmap(NULL, NUM_FRAMES * FRAME_SIZE, PROT_READ | PROT_WRITE,
+			   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (umem_buffer == MAP_FAILED) {
+		fprintf(stderr, "ERR: Failed to allocate umem buffer: %s\n", strerror(errno));
+		return -1;
+	}
+
+	/* Create umem */
+	umem = calloc(1, sizeof(*umem));
+	if (!umem) {
+		munmap(umem_buffer, NUM_FRAMES * FRAME_SIZE);
+		return -1;
+	}
+
+	ret = xsk_umem__create(&umem->umem, umem_buffer, NUM_FRAMES * FRAME_SIZE,
+			       &umem->fq, &umem->cq, &umem_cfg);
+	if (ret) {
+		fprintf(stderr, "ERR: Failed to create umem: %s\n", strerror(-ret));
+		free(umem);
+		munmap(umem_buffer, NUM_FRAMES * FRAME_SIZE);
+		return -1;
+	}
+	umem->buffer = umem_buffer;
+
+	/* Create socket info */
+	xsk_info = calloc(1, sizeof(*xsk_info));
+	if (!xsk_info) {
+		xsk_umem__delete(umem->umem);
+		free(umem);
+		munmap(umem_buffer, NUM_FRAMES * FRAME_SIZE);
+		return -1;
+	}
+	xsk_info->umem = umem;
+
+	/* Initialize umem frame addresses */
+	for (int i = 0; i < NUM_FRAMES; i++)
+		xsk_info->umem_frame_addr[i] = i * FRAME_SIZE;
+	xsk_info->umem_frame_free = NUM_FRAMES;
+
+	/* Create AF_XDP socket */
+	ret = xsk_socket__create(&xsk_info->xsk, ifname, 0, umem->umem,
+				 &xsk_info->rx, &xsk_info->tx, &xsk_cfg);
+	if (ret) {
+		fprintf(stderr, "ERR: Failed to create AF_XDP socket: %s\n", strerror(-ret));
+		xsk_umem__delete(umem->umem);
+		free(xsk_info);
+		free(umem);
+		munmap(umem_buffer, NUM_FRAMES * FRAME_SIZE);
+		return -1;
+	}
+
+	/* Get xsks_map file descriptor */
+	map_fd_xsks = find_map_fd(bpf_obj, "xsks_map");
+	if (map_fd_xsks < 0) {
+		fprintf(stderr, "ERR: Failed to find xsks_map\n");
+		xsk_socket__delete(xsk_info->xsk);
+		xsk_umem__delete(umem->umem);
+		free(xsk_info);
+		free(umem);
+		munmap(umem_buffer, NUM_FRAMES * FRAME_SIZE);
+		return -1;
+	}
+
+	/* Add socket to xsks_map */
+	ret = xsk_socket__update_xskmap(xsk_info->xsk, map_fd_xsks);
+	if (ret) {
+		fprintf(stderr, "ERR: Failed to update xsks_map: %s\n", strerror(-ret));
+		xsk_socket__delete(xsk_info->xsk);
+		xsk_umem__delete(umem->umem);
+		free(xsk_info);
+		free(umem);
+		munmap(umem_buffer, NUM_FRAMES * FRAME_SIZE);
+		return -1;
+	}
+
+	/* Fill the fill queue */
+	uint32_t idx_fq;
+	ret = xsk_ring_prod__reserve(&umem->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS, &idx_fq);
+	if (ret == XSK_RING_PROD__DEFAULT_NUM_DESCS) {
+		for (int i = 0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS; i++)
+			*xsk_ring_prod__fill_addr(&umem->fq, idx_fq++) =
+				xsk_alloc_umem_frame(xsk_info);
+		xsk_ring_prod__submit(&umem->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS);
+	}
+
+	printf("AF_XDP socket created and added to xsks_map\n");
+
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -256,8 +501,22 @@ int main(int argc, char **argv)
 	printf("XDP program attached to input interface %s (ifindex %d)\n", 
 	       cfg.ifname, cfg.ifindex);
 	
+	/* Setup AF_XDP socket for matching packets */
+	if (setup_af_xdp_socket(cfg.ifname, cfg.ifindex, bpf_obj) < 0) {
+		fprintf(stderr, "WARNING: Failed to setup AF_XDP socket, matching packets will go to output interface\n");
+	} else {
+		/* Start packet reader thread */
+		if (pthread_create(&xsk_thread, NULL, xsk_packet_reader, xsk_info) != 0) {
+			fprintf(stderr, "ERR: Failed to create AF_XDP reader thread: %s\n", strerror(errno));
+			/* Cleanup will handle xsk_info */
+		} else {
+			printf("AF_XDP packet reader thread started\n");
+		}
+	}
+	
 	printf("\nNOTE: Make sure there is traffic on %s for counters to increment.\n", cfg.ifname);
-	printf("      You can test with: ping6 or send test packets to the interface.\n");
+	printf("      Matching packets will be hexdumped from AF_XDP socket.\n");
+	printf("      Non-matching packets will be redirected to %s.\n", argv[2]);
 	printf("Press Ctrl+C to stop\n\n");
 	
 	/* Set up signal handler */
@@ -275,6 +534,23 @@ int main(int argc, char **argv)
 	printf("\nDetaching XDP program...\n");
 	
 cleanup:
+	/* Wait for AF_XDP thread to finish */
+	if (xsk_info && xsk_info->xsk) {
+		/* Only join if thread was created (socket exists) */
+		pthread_join(xsk_thread, NULL);
+		if (xsk_info->xsk) {
+			xsk_socket__delete(xsk_info->xsk);
+		}
+		if (xsk_info->umem && xsk_info->umem->umem) {
+			xsk_umem__delete(xsk_info->umem->umem);
+			if (xsk_info->umem->buffer) {
+				munmap(xsk_info->umem->buffer, NUM_FRAMES * FRAME_SIZE);
+			}
+			free(xsk_info->umem);
+		}
+		free(xsk_info);
+	}
+	
 	if (output_program) {
 		int detach_err = xdp_program__detach(output_program, output_ifindex, output_attach_mode, 0);
 		if (detach_err) {
