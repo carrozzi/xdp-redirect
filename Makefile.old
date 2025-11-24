@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: GPL-2.0
+# Makefile for XDP MacSec statistics example
+
+COMMON_DIR := ../common
+
+include $(COMMON_DIR)/common.mk
+CLANG ?= clang
+LLC ?= llc
+ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
+
+# Enable pseudowire control word parsing (set to 1 to enable, 0 to disable)
+ENABLE_PW_CW ?= 0
+
+# BPF flags
+BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -I/usr/include/bpf
+ifeq ($(ENABLE_PW_CW),1)
+BPF_CFLAGS += -DENABLE_PW_CONTROL_WORD
+endif
+
+# User-space flags
+CFLAGS := -Wall -Wextra -O2 -g
+LDFLAGS := -lelf -lz -lbpf
+
+# Source files
+XDP_SRC := xdp_prog.c
+USER_SRC := user_prog.c
+XDP_OBJ := xdp_prog.o
+SKEL_HEADER := xdp_prog.skel.h
+
+# Default target
+all: xdp_prog.o user_prog
+
+# Compile XDP program
+$(XDP_OBJ): $(XDP_SRC)
+	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+
+# Generate skeleton header
+xdp_prog.skel.h: $(XDP_OBJ)
+	bpftool gen skeleton $< > $@
+
+# Compile user-space program
+user_prog: $(USER_SRC) xdp_prog.skel.h
+	$(CC) $(CFLAGS) -o $@ $(USER_SRC) $(LDFLAGS)
+
+# Clean
+clean:
+	rm -f $(XDP_OBJ) user_prog xdp_prog.skel.h
+
+# Install (requires root)
+install: all
+	@echo "To install, run as root:"
+	@echo "  ./user_prog <interface_name> [interval]"
+
+.PHONY: all clean install
+
