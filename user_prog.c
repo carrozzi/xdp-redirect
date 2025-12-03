@@ -71,7 +71,6 @@ static int input_ifindex = -1;
 static int output_ifindex = -1;
 static __u32 input_xdp_flags = 0;
 static __u32 output_xdp_flags = 0;
-static int output_prog_fd = -1;
 
 static void sig_int(int signo)
 {
@@ -94,6 +93,35 @@ out:
 	return map_fd;
 }
 
+/* Helper to aggregate PERCPU global stats */
+static void aggregate_global_stats(struct global_stats *percpu_values, int num_cpus, struct global_stats *out)
+{
+	memset(out, 0, sizeof(*out));
+	for (int i = 0; i < num_cpus; i++) {
+		out->total_packets += percpu_values[i].total_packets;
+		out->total_matching_packets += percpu_values[i].total_matching_packets;
+		out->redirect_xdp_ok += percpu_values[i].redirect_xdp_ok;
+		out->redirect_devmap_ok += percpu_values[i].redirect_devmap_ok;
+		out->redirect_devmap_fail += percpu_values[i].redirect_devmap_fail;
+		/* For packet_counter, take the max across CPUs */
+		if (percpu_values[i].packet_counter > out->packet_counter)
+			out->packet_counter = percpu_values[i].packet_counter;
+	}
+}
+
+/* Helper to aggregate PERCPU if_stats */
+static void aggregate_if_stats(struct if_stats *percpu_values, int num_cpus, struct if_stats *out)
+{
+	memset(out, 0, sizeof(*out));
+	for (int i = 0; i < num_cpus; i++) {
+		out->rx_packets += percpu_values[i].rx_packets;
+		out->rx_matching += percpu_values[i].rx_matching;
+		out->tx_redirect_ok += percpu_values[i].tx_redirect_ok;
+		out->tx_redirect_fail += percpu_values[i].tx_redirect_fail;
+		out->tx_xdp_ok += percpu_values[i].tx_xdp_ok;
+	}
+}
+
 static void print_stats(struct bpf_object *obj)
 {
 	struct global_stats global_stats;
@@ -103,6 +131,7 @@ static void print_stats(struct bpf_object *obj)
 	__u64 next_key;
 	int err;
 	int map_fd_global, map_fd_sci;
+	int num_cpus = libbpf_num_possible_cpus();
 	
 	map_fd_global = find_map_fd(obj, "global_stats_map");
 	map_fd_sci = find_map_fd(obj, "sci_stats_map");
@@ -112,17 +141,20 @@ static void print_stats(struct bpf_object *obj)
 		return;
 	}
 	
-	/* Get global statistics */
-	err = bpf_map_lookup_elem(map_fd_global, &zero, &global_stats);
-	if (err) {
-		if (errno != ENOENT) {
-			fprintf(stderr, "Failed to lookup global stats: %s\n", strerror(errno));
-		}
-		/* If map is empty, initialize with zeros */
-		global_stats.total_packets = 0;
-		global_stats.total_matching_packets = 0;
-		global_stats.packet_counter = 0;
+	/* Get global statistics (PERCPU - need to aggregate) */
+	struct global_stats *percpu_global = calloc(num_cpus, sizeof(struct global_stats));
+	if (!percpu_global) {
+		fprintf(stderr, "ERR: failed to allocate memory for PERCPU stats\n");
+		return;
 	}
+	
+	err = bpf_map_lookup_elem(map_fd_global, &zero, percpu_global);
+	if (err) {
+		memset(&global_stats, 0, sizeof(global_stats));
+	} else {
+		aggregate_global_stats(percpu_global, num_cpus, &global_stats);
+	}
+	free(percpu_global);
 	
 	printf("\n=== Global Statistics ===\n");
 	printf("Total packets: %" PRIu64 "\n", (uint64_t)global_stats.total_packets);
@@ -134,6 +166,38 @@ static void print_stats(struct bpf_object *obj)
 	printf("AF_XDP redirects (matching): %" PRIu64 "\n", (uint64_t)global_stats.redirect_xdp_ok);
 	printf("DEVMAP redirects (success):  %" PRIu64 "\n", (uint64_t)global_stats.redirect_devmap_ok);
 	printf("DEVMAP redirects (failed):   %" PRIu64 "\n", (uint64_t)global_stats.redirect_devmap_fail);
+	
+	/* Per-interface statistics (PERCPU) */
+	int map_fd_if = find_map_fd(obj, "if_stats_map");
+	if (map_fd_if >= 0) {
+		struct if_stats *percpu_if = calloc(num_cpus, sizeof(struct if_stats));
+		struct if_stats if_stats_entry;
+		__u32 ifidx = 0;
+		__u32 next_ifidx;
+		
+		printf("\n=== Per-Interface Statistics ===\n");
+		printf("%-10s %-12s %-12s %-12s %-12s %-12s\n", 
+		       "IfIndex", "RX Pkts", "RX Match", "TX Redir", "TX Fail", "TX XDP");
+		printf("%-10s %-12s %-12s %-12s %-12s %-12s\n",
+		       "-------", "-------", "--------", "--------", "-------", "------");
+		
+		if (percpu_if) {
+			while (bpf_map_get_next_key(map_fd_if, ifidx ? &ifidx : NULL, &next_ifidx) == 0) {
+				ifidx = next_ifidx;
+				if (bpf_map_lookup_elem(map_fd_if, &ifidx, percpu_if) == 0) {
+					aggregate_if_stats(percpu_if, num_cpus, &if_stats_entry);
+					printf("%-10u %-12" PRIu64 " %-12" PRIu64 " %-12" PRIu64 " %-12" PRIu64 " %-12" PRIu64 "\n",
+					       ifidx,
+					       (uint64_t)if_stats_entry.rx_packets,
+					       (uint64_t)if_stats_entry.rx_matching,
+					       (uint64_t)if_stats_entry.tx_redirect_ok,
+					       (uint64_t)if_stats_entry.tx_redirect_fail,
+					       (uint64_t)if_stats_entry.tx_xdp_ok);
+				}
+			}
+			free(percpu_if);
+		}
+	}
 	
 	/* Iterate through all SCIs */
 	printf("\n=== Per-SCI Statistics ===\n");
@@ -445,28 +509,6 @@ static struct bpf_object *load_bpf_object(const char *filename, const char *prog
 }
 
 /* Attach XDP program to interface using libbpf */
-static int attach_xdp(int ifindex, int prog_fd, __u32 *flags_out)
-{
-	int err;
-
-	/* Try native mode first */
-	err = bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_DRV_MODE, NULL);
-	if (err == 0) {
-		*flags_out = XDP_FLAGS_DRV_MODE;
-		return 0;
-	}
-
-	/* Fall back to SKB mode */
-	err = bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_SKB_MODE, NULL);
-	if (err == 0) {
-		*flags_out = XDP_FLAGS_SKB_MODE;
-		return 0;
-	}
-
-	fprintf(stderr, "ERR: Failed to attach XDP program: %s\n", strerror(-err));
-	return err;
-}
-
 /* Detach XDP program from interface */
 static int detach_xdp(int ifindex, __u32 flags)
 {
@@ -479,7 +521,6 @@ int main(int argc, char **argv)
 	int interval = 2; /* Default 2 seconds */
 	int prog_fd = -1;
 	char *input_ifname;
-	struct bpf_object *output_obj = NULL;
 	
 	if (argc < 3) {
 		fprintf(stderr, "Usage: %s <input_ifname> <output_ifname> [interval_seconds]\n", argv[0]);
@@ -513,55 +554,50 @@ int main(int argc, char **argv)
 		return EXIT_FAIL_OPTION;
 	}
 	
-	/* Load and attach pass program to output interface FIRST to determine mode */
-	printf("Loading XDP pass program for output interface %s...\n", output_ifname);
-	output_obj = load_bpf_object("xdp_prog.o", "xdp_pass_func", &output_prog_fd);
-	if (!output_obj) {
-		fprintf(stderr, "WARNING: Failed to load output XDP program, redirect may not work\n");
-	} else {
-		err = attach_xdp(output_ifindex, output_prog_fd, &output_xdp_flags);
-		if (err) {
-			fprintf(stderr, "WARNING: Failed to attach XDP program to %s\n", output_ifname);
-			bpf_object__close(output_obj);
-			output_obj = NULL;
-		} else {
-			printf("Attached XDP pass program to %s in %s mode\n", output_ifname,
-			       (output_xdp_flags & XDP_FLAGS_DRV_MODE) ? "native" : "SKB");
-		}
-	}
-	
-	/* Load main XDP program */
-	printf("Loading XDP program for input interface %s...\n", input_ifname);
+	/* Load main XDP program (will be attached to BOTH interfaces for bidirectional) */
+	printf("Loading XDP program...\n");
 	bpf_obj = load_bpf_object("xdp_prog.o", "xdp_macsec_stats", &prog_fd);
 	if (!bpf_obj) {
 		return EXIT_FAIL_BPF;
 	}
 	
-	/* Attach input interface in SAME mode as output for DEVMAP redirect to work */
-	if (output_obj && (output_xdp_flags & XDP_FLAGS_SKB_MODE)) {
-		/* Output is in SKB mode, force input to SKB mode too */
-		printf("Forcing input interface to SKB mode to match output interface\n");
-		err = bpf_xdp_attach(input_ifindex, prog_fd, XDP_FLAGS_SKB_MODE, NULL);
-		if (err == 0) {
-			input_xdp_flags = XDP_FLAGS_SKB_MODE;
-		} else {
-			fprintf(stderr, "ERR: Failed to attach XDP program in SKB mode: %s\n", strerror(-err));
-			bpf_object__close(bpf_obj);
-			return EXIT_FAIL_BPF;
-		}
+	/* Determine the best XDP mode that works for BOTH interfaces */
+	/* Try native mode on output interface first to probe its capabilities */
+	err = bpf_xdp_attach(output_ifindex, prog_fd, XDP_FLAGS_DRV_MODE, NULL);
+	if (err == 0) {
+		output_xdp_flags = XDP_FLAGS_DRV_MODE;
+		printf("Attached XDP program to %s in native mode\n", output_ifname);
 	} else {
-		/* Try native first, fall back to SKB */
-		err = attach_xdp(input_ifindex, prog_fd, &input_xdp_flags);
+		/* Output doesn't support native, use SKB mode for both */
+		err = bpf_xdp_attach(output_ifindex, prog_fd, XDP_FLAGS_SKB_MODE, NULL);
 		if (err) {
-			fprintf(stderr, "ERR: Failed to attach XDP program to %s\n", input_ifname);
+			fprintf(stderr, "ERR: Failed to attach XDP to %s: %s\n", output_ifname, strerror(-err));
 			bpf_object__close(bpf_obj);
 			return EXIT_FAIL_BPF;
 		}
+		output_xdp_flags = XDP_FLAGS_SKB_MODE;
+		printf("Attached XDP program to %s in SKB mode\n", output_ifname);
 	}
+	
+	/* Attach to input interface in SAME mode for bidirectional DEVMAP redirect */
+	err = bpf_xdp_attach(input_ifindex, prog_fd, output_xdp_flags, NULL);
+	if (err) {
+		fprintf(stderr, "ERR: Failed to attach XDP to %s in %s mode: %s\n",
+			input_ifname,
+			(output_xdp_flags & XDP_FLAGS_DRV_MODE) ? "native" : "SKB",
+			strerror(-err));
+		bpf_xdp_detach(output_ifindex, output_xdp_flags, NULL);
+		bpf_object__close(bpf_obj);
+		return EXIT_FAIL_BPF;
+	}
+	input_xdp_flags = output_xdp_flags;
 	printf("Attached XDP program to %s in %s mode\n", input_ifname,
 	       (input_xdp_flags & XDP_FLAGS_DRV_MODE) ? "native" : "SKB");
 	
-	/* Configure redirect map with output interface */
+	/* Configure bidirectional redirect map:
+	 * input_ifindex -> output_ifindex
+	 * output_ifindex -> input_ifindex
+	 */
 	int map_fd_tx = find_map_fd(bpf_obj, "tx_port");
 	if (map_fd_tx < 0) {
 		fprintf(stderr, "ERR: Failed to find tx_port map\n");
@@ -569,37 +605,46 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 	
-	int key = 0;
-	err = bpf_map_update_elem(map_fd_tx, &key, &output_ifindex, BPF_ANY);
+	/* Direction 1: input -> output */
+	err = bpf_map_update_elem(map_fd_tx, &input_ifindex, &output_ifindex, BPF_ANY);
 	if (err) {
-		fprintf(stderr, "ERR: Failed to update tx_port map: %s\n", strerror(errno));
+		fprintf(stderr, "ERR: Failed to update tx_port map (input->output): %s\n", strerror(errno));
 		err = EXIT_FAIL_BPF;
 		goto cleanup;
 	}
 	
-	/* Verify the map was set correctly */
-	unsigned int verify_ifindex = 0;
-	err = bpf_map_lookup_elem(map_fd_tx, &key, &verify_ifindex);
-	if (err || verify_ifindex != (unsigned int)output_ifindex) {
-		fprintf(stderr, "ERR: Failed to verify tx_port map (got ifindex %u, expected %d)\n",
-			verify_ifindex, output_ifindex);
+	/* Direction 2: output -> input */
+	err = bpf_map_update_elem(map_fd_tx, &output_ifindex, &input_ifindex, BPF_ANY);
+	if (err) {
+		fprintf(stderr, "ERR: Failed to update tx_port map (output->input): %s\n", strerror(errno));
 		err = EXIT_FAIL_BPF;
 		goto cleanup;
 	}
 	
-	printf("Configured redirect: %s (ifindex %d) -> %s (ifindex %d)\n",
+	printf("Configured bidirectional redirect:\n");
+	printf("  %s (ifindex %d) <-> %s (ifindex %d)\n",
 	       input_ifname, input_ifindex, output_ifname, output_ifindex);
 	
-	/* Enable promiscuous mode on input interface */
+	/* Enable promiscuous mode on both interfaces */
 	struct ifreq ifr;
 	int sock_promisc = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sock_promisc >= 0) {
+		/* Input interface */
 		memset(&ifr, 0, sizeof(ifr));
 		strncpy(ifr.ifr_name, input_ifname, IFNAMSIZ - 1);
 		if (ioctl(sock_promisc, SIOCGIFFLAGS, &ifr) == 0) {
 			ifr.ifr_flags |= IFF_PROMISC;
 			if (ioctl(sock_promisc, SIOCSIFFLAGS, &ifr) == 0) {
 				printf("Enabled promiscuous mode on %s\n", input_ifname);
+			}
+		}
+		/* Output interface */
+		memset(&ifr, 0, sizeof(ifr));
+		strncpy(ifr.ifr_name, output_ifname, IFNAMSIZ - 1);
+		if (ioctl(sock_promisc, SIOCGIFFLAGS, &ifr) == 0) {
+			ifr.ifr_flags |= IFF_PROMISC;
+			if (ioctl(sock_promisc, SIOCSIFFLAGS, &ifr) == 0) {
+				printf("Enabled promiscuous mode on %s\n", output_ifname);
 			}
 		}
 		close(sock_promisc);
@@ -664,20 +709,15 @@ cleanup:
 		close(output_raw_sock);
 	}
 	
-	/* Detach output XDP program */
-	if (output_obj) {
+	/* Detach XDP program from both interfaces */
+	if (bpf_obj) {
 		int detach_err = detach_xdp(output_ifindex, output_xdp_flags);
 		if (detach_err) {
-			fprintf(stderr, "Error detaching output XDP program: %s\n", strerror(-detach_err));
+			fprintf(stderr, "Error detaching XDP program from output: %s\n", strerror(-detach_err));
 		}
-		bpf_object__close(output_obj);
-	}
-	
-	/* Detach input XDP program */
-	if (bpf_obj) {
-		int detach_err = detach_xdp(input_ifindex, input_xdp_flags);
+		detach_err = detach_xdp(input_ifindex, input_xdp_flags);
 		if (detach_err) {
-			fprintf(stderr, "Error detaching input XDP program: %s\n", strerror(-detach_err));
+			fprintf(stderr, "Error detaching XDP program from input: %s\n", strerror(-detach_err));
 		}
 		bpf_object__close(bpf_obj);
 	}

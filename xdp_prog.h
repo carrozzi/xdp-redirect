@@ -23,5 +23,14 @@ struct global_stats {
 	uint64_t redirect_devmap_fail;	/* Failed DEVMAP redirects (fallback to pass) */
 };
 
+/* Per-interface statistics */
+struct if_stats {
+	uint64_t rx_packets;		/* Packets received on this interface */
+	uint64_t rx_matching;		/* Matching packets received */
+	uint64_t tx_redirect_ok;	/* Successful redirects to other interface */
+	uint64_t tx_redirect_fail;	/* Failed redirects */
+	uint64_t tx_xdp_ok;		/* Successful AF_XDP redirects */
+};
+
 #endif /* __XDP_PROG_H */
 
