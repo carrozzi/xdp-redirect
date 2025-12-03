@@ -657,6 +657,8 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 	
+	/* AF_XDP disabled for performance testing - all packets use DEVMAP redirect */
+#ifdef ENABLE_AF_XDP
 	/* Setup AF_XDP socket for matching packets */
 	if (setup_af_xdp_socket(input_ifname, input_ifindex, bpf_obj) < 0) {
 		fprintf(stderr, "WARNING: Failed to setup AF_XDP socket, matching packets will use DEVMAP redirect\n");
@@ -668,10 +670,10 @@ int main(int argc, char **argv)
 			printf("AF_XDP packet reader thread started\n");
 		}
 	}
+#endif
 	
 	printf("\nNOTE: Make sure there is traffic on %s for counters to increment.\n", input_ifname);
-	printf("      Matching packets will be sent to %s via AF_XDP socket.\n", output_ifname);
-	printf("      Non-matching packets will be redirected to %s via DEVMAP.\n", output_ifname);
+	printf("      All packets will be redirected to %s via DEVMAP.\n", output_ifname);
 	printf("Press Ctrl+C to stop\n\n");
 	
 	/* Set up signal handler */

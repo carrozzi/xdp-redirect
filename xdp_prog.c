@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /* XDP program to track statistics for ethernet/IPv4/GRE/MPLS/Ethernet/macsec packets */
 
+/* Enable full statistics tracking (no significant performance impact) */
+#define ENABLE_FULL_STATS
+
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
@@ -132,6 +135,7 @@ static __always_inline void *parse_header(void *data, void *data_end, __u32 size
 	return data;
 }
 
+#ifdef ENABLE_FULL_STATS
 /* Helper function to get or create per-interface stats */
 static __always_inline struct if_stats *get_if_stats(__u32 ifindex)
 {
@@ -143,33 +147,9 @@ static __always_inline struct if_stats *get_if_stats(__u32 ifindex)
 	}
 	return stats;
 }
+#endif
 
-/* Helper function for DEVMAP redirect with stats tracking (bidirectional) */
-static __always_inline int do_redirect_devmap(struct xdp_md *ctx)
-{
-	__u32 zero = 0;
-	__u32 ingress_ifindex = ctx->ingress_ifindex;
-	struct global_stats *gstats = bpf_map_lookup_elem(&global_stats_map, &zero);
-	struct if_stats *ifstats = get_if_stats(ingress_ifindex);
-	
-	/* Use ingress_ifindex as key to find the egress interface */
-	int ret = bpf_redirect_map(&tx_port, ingress_ifindex, 0);
-	if (ret == XDP_REDIRECT) {
-		if (gstats)
-			gstats->redirect_devmap_ok++;  /* No atomic needed for PERCPU */
-		if (ifstats)
-			ifstats->tx_redirect_ok++;
-		return ret;
-	}
-	/* Redirect failed - fall back to XDP_PASS */
-	if (gstats)
-		gstats->redirect_devmap_fail++;
-	if (ifstats)
-		ifstats->tx_redirect_fail++;
-	return XDP_PASS;
-}
-
-/* Main XDP program */
+/* Fast-path XDP program - minimal stats for performance testing */
 SEC("xdp")
 int xdp_macsec_stats(struct xdp_md *ctx)
 {
@@ -187,6 +167,7 @@ int xdp_macsec_stats(struct xdp_md *ctx)
 	struct ethhdr *inner_eth;
 	struct macsechdr *macsec;
 	
+#ifdef ENABLE_FULL_STATS
 	__u64 sci;
 	__u32 zero = 0;
 	__u32 ingress_ifindex = ctx->ingress_ifindex;
@@ -203,44 +184,45 @@ int xdp_macsec_stats(struct xdp_md *ctx)
 	global_stats = bpf_map_lookup_elem(&global_stats_map, &zero);
 	if (global_stats)
 		global_stats->total_packets++;  /* No atomic needed for PERCPU */
+#endif
 	
 	/* Parse outer Ethernet header */
 	eth = parse_header(ptr, data_end, sizeof(*eth));
 	if (!eth)
-		return do_redirect_devmap(ctx);
+		return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 	
-	/* Check for IPv4 */
+	/* Check for IPv4 - non-matching packets redirect directly */
 	if (eth->h_proto != bpf_htons(0x0800))
-		return do_redirect_devmap(ctx);
+		return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 	
 	ptr += sizeof(*eth);
 	
 	/* Parse IPv4 header */
 	ipv4 = parse_header(ptr, data_end, sizeof(*ipv4));
 	if (!ipv4)
-		return do_redirect_devmap(ctx);
+		return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 	
 	/* Check for GRE (protocol 47) */
 	if (ipv4->protocol != 47)
-		return do_redirect_devmap(ctx);
+		return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 	
 	ptr += sizeof(*ipv4);
 	
 	/* Parse GRE header */
 	gre = parse_header(ptr, data_end, sizeof(*gre));
 	if (!gre)
-		return do_redirect_devmap(ctx);
+		return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 	
 	/* Check for MPLS payload (0x8847) */
 	if (gre->protocol != bpf_htons(0x8847)) /* MPLS over GRE */
-		return do_redirect_devmap(ctx);
+		return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 	
 	ptr += sizeof(*gre);
 	
 	/* Parse MPLS header */
 	mpls = parse_header(ptr, data_end, sizeof(*mpls));
 	if (!mpls)
-		return do_redirect_devmap(ctx);
+		return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 	
 	/* Skip MPLS stack (simplified - assumes single label) */
 	ptr += sizeof(*mpls);
@@ -249,7 +231,7 @@ int xdp_macsec_stats(struct xdp_md *ctx)
 	/* Parse Pseudowire Control Word (4 bytes) */
 	pw_cw = parse_header(ptr, data_end, sizeof(*pw_cw));
 	if (!pw_cw)
-		return do_redirect_devmap(ctx);
+		return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 	
 	/* Skip control word */
 	ptr += sizeof(*pw_cw);
@@ -258,19 +240,20 @@ int xdp_macsec_stats(struct xdp_md *ctx)
 	/* Parse inner Ethernet header */
 	inner_eth = parse_header(ptr, data_end, sizeof(*inner_eth));
 	if (!inner_eth)
-		return do_redirect_devmap(ctx);
+		return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 	
 	/* Check for MacSec (EtherType 0x88E5) */
 	if (inner_eth->h_proto != bpf_htons(0x88E5))
-		return do_redirect_devmap(ctx);
+		return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 	
 	ptr += sizeof(*inner_eth);
 	
 	/* Parse MacSec header */
 	macsec = parse_header(ptr, data_end, sizeof(*macsec));
 	if (!macsec)
-		return do_redirect_devmap(ctx);
+		return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 	
+#ifdef ENABLE_FULL_STATS
 	/* Extract packet number from MacSec header (32-bit, at offset 2)
 	 * Read directly as bytes to avoid structure alignment issues
 	 */
@@ -307,20 +290,10 @@ int xdp_macsec_stats(struct xdp_md *ctx)
 		/* Store the latest packet number (direct assignment for debugging) */
 		sci_stats->latest_packet_num = packet_number;
 	}
+#endif /* ENABLE_FULL_STATS */
 	
-	/* Redirect matching packets to AF_XDP socket */
-	/* bpf_redirect_map returns XDP_REDIRECT on success */
-	/* If AF_XDP socket not available, fall back to output interface */
-	int ret = bpf_redirect_map(&xsks_map, ctx->rx_queue_index, 0);
-	if (ret == XDP_REDIRECT) {
-		if (global_stats)
-			global_stats->redirect_xdp_ok++;
-		if (if_stats)
-			if_stats->tx_xdp_ok++;
-		return ret;
-	}
-	/* Fall back to output interface if AF_XDP socket not configured */
-	return do_redirect_devmap(ctx);
+	/* Redirect matching packets directly via DEVMAP */
+	return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 }
 
 /* Simple XDP program for output interface - just passes packets through */
@@ -328,6 +301,13 @@ SEC("xdp")
 int xdp_pass_func(struct xdp_md *ctx)
 {
 	return XDP_PASS;
+}
+
+/* Minimal redirect program - no parsing, just redirect everything */
+SEC("xdp")
+int xdp_redirect_minimal(struct xdp_md *ctx)
+{
+	return bpf_redirect_map(&tx_port, ctx->ingress_ifindex, 0);
 }
 
 char _license[] SEC("license") = "GPL";
