@@ -62,6 +62,8 @@ struct xsk_socket_info {
 static struct xsk_socket_info *xsk_info = NULL;
 static pthread_t xsk_thread;
 static char *output_ifname = NULL;
+static int output_raw_sock = -1;
+static struct sockaddr_ll output_saddr;
 
 /* Global state for cleanup */
 static struct bpf_object *bpf_obj = NULL;
@@ -95,17 +97,17 @@ out:
 static void print_stats(struct bpf_object *obj)
 {
 	struct global_stats global_stats;
-	struct mpls_label_stats label_stats;
+	struct sci_stats sci_stats_entry;
 	__u32 zero = 0;
-	__u32 mpls_label = 0;
-	__u32 next_key;
+	__u64 sci = 0;
+	__u64 next_key;
 	int err;
-	int map_fd_global, map_fd_mpls;
+	int map_fd_global, map_fd_sci;
 	
 	map_fd_global = find_map_fd(obj, "global_stats_map");
-	map_fd_mpls = find_map_fd(obj, "mpls_stats_map");
+	map_fd_sci = find_map_fd(obj, "sci_stats_map");
 	
-	if (map_fd_global < 0 || map_fd_mpls < 0) {
+	if (map_fd_global < 0 || map_fd_sci < 0) {
 		fprintf(stderr, "ERR: failed to find maps\n");
 		return;
 	}
@@ -123,35 +125,39 @@ static void print_stats(struct bpf_object *obj)
 	}
 	
 	printf("\n=== Global Statistics ===\n");
-	printf("Total packets: %" PRIu64 "\n", global_stats.total_packets);
-	printf("Matching packets: %" PRIu64 "\n", global_stats.total_matching_packets);
+	printf("Total packets: %" PRIu64 "\n", (uint64_t)global_stats.total_packets);
+	printf("Matching packets: %" PRIu64 "\n", (uint64_t)global_stats.total_matching_packets);
 	printf("Non-matching packets: %" PRIu64 "\n", 
-	       global_stats.total_packets - global_stats.total_matching_packets);
+	       (uint64_t)(global_stats.total_packets - global_stats.total_matching_packets));
 	printf("Latest packet number: %" PRIu32 "\n", global_stats.packet_counter);
+	printf("\n=== Redirect Statistics ===\n");
+	printf("AF_XDP redirects (matching): %" PRIu64 "\n", (uint64_t)global_stats.redirect_xdp_ok);
+	printf("DEVMAP redirects (success):  %" PRIu64 "\n", (uint64_t)global_stats.redirect_devmap_ok);
+	printf("DEVMAP redirects (failed):   %" PRIu64 "\n", (uint64_t)global_stats.redirect_devmap_fail);
 	
-	/* Iterate through all MPLS labels */
-	printf("\n=== Per-MPLS-Label Statistics ===\n");
-	printf("%-15s %-20s %-25s\n", "MPLS Label", "Packet Count", "Latest Packet Number");
-	printf("%-15s %-20s %-25s\n", "-----------", "------------", "---------------------");
+	/* Iterate through all SCIs */
+	printf("\n=== Per-SCI Statistics ===\n");
+	printf("%-20s %-20s %-25s\n", "SCI", "Packet Count", "Latest Packet Number");
+	printf("%-20s %-20s %-25s\n", "-------------------", "------------", "---------------------");
 	
 	/* Start iteration from NULL (first key) */
 	next_key = 0;
-	while (bpf_map_get_next_key(map_fd_mpls, 
-				     mpls_label ? &mpls_label : NULL, 
+	while (bpf_map_get_next_key(map_fd_sci, 
+				     sci ? &sci : NULL, 
 				     &next_key) == 0) {
-		mpls_label = next_key;
+		sci = next_key;
 		
-		err = bpf_map_lookup_elem(map_fd_mpls, &mpls_label, &label_stats);
+		err = bpf_map_lookup_elem(map_fd_sci, &sci, &sci_stats_entry);
 		if (err) {
-			fprintf(stderr, "Failed to lookup MPLS label %u: %s\n",
-				mpls_label, strerror(errno));
+			fprintf(stderr, "Failed to lookup SCI 0x%016" PRIx64 ": %s\n",
+				(uint64_t)__builtin_bswap64(sci), strerror(errno));
 			continue;
 		}
 		
-		printf("%-15u %-20" PRIu64 " %-25" PRIu32 "\n",
-		       mpls_label,
-		       label_stats.packet_count,
-		       label_stats.latest_packet_num);
+		printf("0x%016" PRIx64 " %-20" PRIu64 " %-25" PRIu64 "\n",
+		       (uint64_t)__builtin_bswap64(sci),
+		       (uint64_t)sci_stats_entry.packet_count,
+		       (uint64_t)sci_stats_entry.latest_packet_num);
 	}
 	
 	printf("\n");
@@ -172,39 +178,48 @@ static void xsk_free_umem_frame(struct xsk_socket_info *xsk, uint64_t addr)
 	xsk->umem_frame_addr[xsk->umem_frame_free++] = addr;
 }
 
-static int send_packet_to_interface(const void *data, size_t len, const char *ifname)
+/* Initialize persistent raw socket for output */
+static int init_output_socket(const char *ifname)
 {
-	struct sockaddr_ll saddr;
 	struct ifreq ifr;
-	int sock;
 	int ret;
 
 	/* Create raw socket */
-	sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-	if (sock < 0) {
+	output_raw_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+	if (output_raw_sock < 0) {
+		fprintf(stderr, "ERR: Failed to create output raw socket: %s\n", strerror(errno));
 		return -1;
 	}
 
 	/* Get interface index */
 	memset(&ifr, 0, sizeof(ifr));
 	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
-	ret = ioctl(sock, SIOCGIFINDEX, &ifr);
+	ret = ioctl(output_raw_sock, SIOCGIFINDEX, &ifr);
 	if (ret < 0) {
-		close(sock);
+		fprintf(stderr, "ERR: Failed to get interface index for %s: %s\n", ifname, strerror(errno));
+		close(output_raw_sock);
+		output_raw_sock = -1;
 		return -1;
 	}
 
-	/* Setup destination address */
-	memset(&saddr, 0, sizeof(saddr));
-	saddr.sll_family = AF_PACKET;
-	saddr.sll_protocol = htons(ETH_P_ALL);
-	saddr.sll_ifindex = ifr.ifr_ifindex;
-	saddr.sll_halen = ETH_ALEN;
+	/* Setup destination address (reused for all sends) */
+	memset(&output_saddr, 0, sizeof(output_saddr));
+	output_saddr.sll_family = AF_PACKET;
+	output_saddr.sll_protocol = htons(ETH_P_ALL);
+	output_saddr.sll_ifindex = ifr.ifr_ifindex;
+	output_saddr.sll_halen = ETH_ALEN;
 
-	/* Send packet */
-	ret = sendto(sock, data, len, 0, (struct sockaddr *)&saddr, sizeof(saddr));
-	close(sock);
+	printf("Initialized persistent raw socket for output interface %s\n", ifname);
+	return 0;
+}
 
+static int send_packet_to_interface(const void *data, size_t len)
+{
+	if (output_raw_sock < 0)
+		return -1;
+
+	int ret = sendto(output_raw_sock, data, len, 0, 
+			 (struct sockaddr *)&output_saddr, sizeof(output_saddr));
 	return (ret < 0) ? -1 : 0;
 }
 
@@ -249,9 +264,7 @@ static void *xsk_packet_reader(void *arg)
 			uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 
 			/* Send packet to output interface */
-			if (output_ifname) {
-				send_packet_to_interface(pkt, len, output_ifname);
-			}
+			send_packet_to_interface(pkt, len);
 
 			/* Free the frame back to the umem */
 			xsk_free_umem_frame(xsk, addr);
@@ -500,23 +513,7 @@ int main(int argc, char **argv)
 		return EXIT_FAIL_OPTION;
 	}
 	
-	/* Load and attach main XDP program to input interface */
-	printf("Loading XDP program for input interface %s...\n", input_ifname);
-	bpf_obj = load_bpf_object("xdp_prog.o", "xdp_macsec_stats", &prog_fd);
-	if (!bpf_obj) {
-		return EXIT_FAIL_BPF;
-	}
-	
-	err = attach_xdp(input_ifindex, prog_fd, &input_xdp_flags);
-	if (err) {
-		fprintf(stderr, "ERR: Failed to attach XDP program to %s\n", input_ifname);
-		bpf_object__close(bpf_obj);
-		return EXIT_FAIL_BPF;
-	}
-	printf("Attached XDP program to %s in %s mode\n", input_ifname,
-	       (input_xdp_flags & XDP_FLAGS_DRV_MODE) ? "native" : "SKB");
-	
-	/* Load and attach pass program to output interface */
+	/* Load and attach pass program to output interface FIRST to determine mode */
 	printf("Loading XDP pass program for output interface %s...\n", output_ifname);
 	output_obj = load_bpf_object("xdp_prog.o", "xdp_pass_func", &output_prog_fd);
 	if (!output_obj) {
@@ -532,6 +529,37 @@ int main(int argc, char **argv)
 			       (output_xdp_flags & XDP_FLAGS_DRV_MODE) ? "native" : "SKB");
 		}
 	}
+	
+	/* Load main XDP program */
+	printf("Loading XDP program for input interface %s...\n", input_ifname);
+	bpf_obj = load_bpf_object("xdp_prog.o", "xdp_macsec_stats", &prog_fd);
+	if (!bpf_obj) {
+		return EXIT_FAIL_BPF;
+	}
+	
+	/* Attach input interface in SAME mode as output for DEVMAP redirect to work */
+	if (output_obj && (output_xdp_flags & XDP_FLAGS_SKB_MODE)) {
+		/* Output is in SKB mode, force input to SKB mode too */
+		printf("Forcing input interface to SKB mode to match output interface\n");
+		err = bpf_xdp_attach(input_ifindex, prog_fd, XDP_FLAGS_SKB_MODE, NULL);
+		if (err == 0) {
+			input_xdp_flags = XDP_FLAGS_SKB_MODE;
+		} else {
+			fprintf(stderr, "ERR: Failed to attach XDP program in SKB mode: %s\n", strerror(-err));
+			bpf_object__close(bpf_obj);
+			return EXIT_FAIL_BPF;
+		}
+	} else {
+		/* Try native first, fall back to SKB */
+		err = attach_xdp(input_ifindex, prog_fd, &input_xdp_flags);
+		if (err) {
+			fprintf(stderr, "ERR: Failed to attach XDP program to %s\n", input_ifname);
+			bpf_object__close(bpf_obj);
+			return EXIT_FAIL_BPF;
+		}
+	}
+	printf("Attached XDP program to %s in %s mode\n", input_ifname,
+	       (input_xdp_flags & XDP_FLAGS_DRV_MODE) ? "native" : "SKB");
 	
 	/* Configure redirect map with output interface */
 	int map_fd_tx = find_map_fd(bpf_obj, "tx_port");
@@ -575,6 +603,13 @@ int main(int argc, char **argv)
 			}
 		}
 		close(sock_promisc);
+	}
+	
+	/* Initialize persistent raw socket for output */
+	if (init_output_socket(output_ifname) < 0) {
+		fprintf(stderr, "ERR: Failed to initialize output socket\n");
+		err = EXIT_FAIL;
+		goto cleanup;
 	}
 	
 	/* Setup AF_XDP socket for matching packets */
@@ -622,6 +657,11 @@ cleanup:
 			free(xsk_info->umem);
 		}
 		free(xsk_info);
+	}
+	
+	/* Close output raw socket */
+	if (output_raw_sock >= 0) {
+		close(output_raw_sock);
 	}
 	
 	/* Detach output XDP program */
